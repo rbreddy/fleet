@@ -75,6 +75,8 @@ func (r *StatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, nil
 	}
 
+	orig := gitrepo.DeepCopy()
+
 	// Restrictions / Overrides, gitrepo reconciler is responsible for setting error in status
 	if err := AuthorizeAndAssignDefaults(ctx, r.Client, gitrepo); err != nil {
 		// the gitjob_controller will handle the error
@@ -134,13 +136,21 @@ func (r *StatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	err = r.Client.Status().Update(ctx, gitrepo)
-	if err != nil {
+	if err := r.updateStatus(ctx, orig, gitrepo); err != nil {
 		logger.Error(err, "Reconcile failed update to git repo status", "status", gitrepo.Status)
 		return ctrl.Result{RequeueAfter: durations.GitRepoStatusDelay}, nil
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *StatusReconciler) updateStatus(ctx context.Context, orig *fleet.GitRepo, obj *fleet.GitRepo) error {
+	statusPatch := client.MergeFrom(orig)
+	if patchData, err := statusPatch.Data(obj); err == nil && string(patchData) == "{}" {
+		// skip update if patch is empty
+		return nil
+	}
+	return r.Client.Status().Patch(ctx, obj, statusPatch)
 }
 
 // bundleStatusChangedPredicate returns true if the bundle
