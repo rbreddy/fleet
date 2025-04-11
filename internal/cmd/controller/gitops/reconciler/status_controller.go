@@ -66,8 +66,8 @@ func (r *StatusReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // display information to the user.
 func (r *StatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName("gitops-status")
-	gitrepo := &fleet.GitRepo{}
 
+	gitrepo := &fleet.GitRepo{}
 	if err := r.Get(ctx, req.NamespacedName, gitrepo); err != nil && !errors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	} else if errors.IsNotFound(err) {
@@ -104,8 +104,7 @@ func (r *StatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	err = setStatus(bdList, gitrepo)
-	if err != nil {
+	if err := setStatus(bdList, gitrepo); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -131,8 +130,7 @@ func (r *StatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// even if there are no bundle deployments, which is the case for issues with rendering the
 	// manifests, for instance. In that case no bundle deployments are created, but an error is set
 	// in a ready status condition on the bundle.
-	err = r.setReadyStatusFromBundle(ctx, gitrepo)
-	if err != nil {
+	if err = r.setReadyStatusFromBundle(ctx, gitrepo); err != nil {
 		return ctrl.Result{}, err
 	}
 
