@@ -3,8 +3,11 @@ package cli
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -32,10 +35,68 @@ type readFile func(name string) ([]byte, error)
 
 // NewApply returns a subcommand to create bundles from directories
 func NewApply() *cobra.Command {
-	return command.Command(&Apply{}, cobra.Command{
+	cmd := command.Command(&Apply{}, cobra.Command{
 		Use:   "apply [flags] BUNDLE_NAME PATH...",
 		Short: "Create bundles from directories, and output them or apply them on a cluster",
 	})
+	var cpuProfile, memProfile, goroutineProfile string
+	cmd.Flags().StringVar(&cpuProfile, "cpuprofile", "", "write cpu profile to file")
+	cmd.Flags().StringVar(&memProfile, "memprofile", "", "write memory profile to file")
+	cmd.Flags().StringVar(&goroutineProfile, "goroutineprofile", "", "write goroutine profile to file")
+
+	originalRun := cmd.Run
+	originalRunE := cmd.RunE
+
+	cmd.RunE = func(c *cobra.Command, args []string) error {
+		if cpuProfile != "" {
+			f, err := os.Create(cpuProfile)
+			if err != nil {
+				return err
+			}
+			if err := pprof.StartCPUProfile(f); err != nil {
+				return err
+			}
+			defer pprof.StopCPUProfile()
+		}
+
+		if memProfile != "" {
+			f, err := os.Create(memProfile)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			defer func() {
+				runtime.GC()
+				if err := pprof.WriteHeapProfile(f); err != nil {
+					log.Printf("coult not write memory profile: %v", err)
+				}
+			}()
+		}
+
+		if goroutineProfile != "" {
+			f, err := os.Create(goroutineProfile)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			defer func() {
+				if err := pprof.Lookup("goroutine").WriteTo(f, 0); err != nil {
+					log.Printf("could not write goroutine profile: %v", err)
+				}
+			}()
+		}
+
+		if originalRunE != nil {
+			return originalRunE(c, args)
+		} else if originalRun != nil {
+			originalRun(c, args)
+		}
+		return nil
+	}
+
+	cmd.Run = nil
+
+	return cmd
 }
 
 type Apply struct {
