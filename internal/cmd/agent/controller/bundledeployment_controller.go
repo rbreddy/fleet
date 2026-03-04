@@ -32,8 +32,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // BundleDeploymentReconciler reconciles a BundleDeployment object, by
@@ -67,10 +70,65 @@ var DefaultRetry = wait.Backoff{
 	Jitter:   0.1,
 }
 
+const (
+	dependsOnIndexKey = "spec.dependsOn"
+)
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *BundleDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	logger := log.Log.WithName("bundledeployment")
+
+	err := mgr.GetFieldIndexer().IndexField(context.Background(), &fleetv1.BundleDeployment{}, dependsOnIndexKey, func(rawObj client.Object) []string {
+		bd, ok := rawObj.(*fleetv1.BundleDeployment)
+		if !ok {
+			return nil
+		}
+
+		var s []string
+		for _, v := range bd.Spec.DependsOn {
+			s = append(s, v.Name)
+		}
+		return s
+	})
+	if err != nil {
+		logger.Error(err, "Failed to index spec.dependsOn")
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fleetv1.BundleDeployment{}).
+		WatchesRawSource(source.TypedKind(
+			mgr.GetCache(),
+			&fleetv1.BundleDeployment{},
+			handler.TypedEnqueueRequestsFromMapFunc(
+				func(ctx context.Context, bundleA *fleetv1.BundleDeployment) []reconcile.Request {
+					var list fleetv1.BundleDeploymentList
+					err := r.List(ctx, &list,
+						client.InNamespace(bundleA.Namespace),
+						client.MatchingFields{dependsOnIndexKey: bundleA.Name},
+					)
+					if err != nil {
+						logger.Error(err, "Failed to list spec.dependsOn for reconciliation")
+						return nil
+					}
+
+					requests := make([]reconcile.Request, len(list.Items))
+					for i, item := range list.Items {
+						requests[i] = reconcile.Request{
+							NamespacedName: client.ObjectKeyFromObject(&item),
+						}
+					}
+
+					return requests
+				},
+			),
+			predicate.TypedFuncs[*fleetv1.BundleDeployment]{
+				UpdateFunc: func(e event.TypedUpdateEvent[*fleetv1.BundleDeployment]) bool {
+					return e.ObjectNew.Status.Ready && !e.ObjectOld.Status.Ready
+				},
+			},
+		),
+		).
 		WithEventFilter(
 			// we do not trigger for status changes
 			predicate.Or(
