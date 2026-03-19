@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -78,50 +77,19 @@ const (
 func (r *BundleDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	logger := log.Log.WithName("bundledeployment")
 
-	err := mgr.GetFieldIndexer().IndexField(context.Background(), &fleetv1.BundleDeployment{}, dependsOnIndexKey, func(rawObj client.Object) []string {
-		bd, ok := rawObj.(*fleetv1.BundleDeployment)
-		if !ok {
-			return nil
-		}
-
-		var s []string
-		for _, v := range bd.Spec.DependsOn {
-			s = append(s, v.Name)
-		}
-		return s
-	})
+	err := mgr.GetFieldIndexer().IndexField(context.Background(), &fleetv1.BundleDeployment{}, dependsOnIndexKey, r.indexBundleDeployment)
 	if err != nil {
 		logger.Error(err, "Failed to index spec.dependsOn")
 		return err
 	}
 
+	// create an indexer for bundles with dependencies
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fleetv1.BundleDeployment{}).
 		WatchesRawSource(source.TypedKind(
 			mgr.GetCache(),
 			&fleetv1.BundleDeployment{},
-			handler.TypedEnqueueRequestsFromMapFunc(
-				func(ctx context.Context, bundleA *fleetv1.BundleDeployment) []reconcile.Request {
-					var list fleetv1.BundleDeploymentList
-					err := r.List(ctx, &list,
-						client.InNamespace(bundleA.Namespace),
-						client.MatchingFields{dependsOnIndexKey: bundleA.Name},
-					)
-					if err != nil {
-						logger.Error(err, "Failed to list spec.dependsOn for reconciliation")
-						return nil
-					}
-
-					requests := make([]reconcile.Request, len(list.Items))
-					for i, item := range list.Items {
-						requests[i] = reconcile.Request{
-							NamespacedName: client.ObjectKeyFromObject(&item),
-						}
-					}
-
-					return requests
-				},
-			),
+			handler.TypedEnqueueRequestsFromMapFunc(r.findObjectsDependingOn),
 			predicate.TypedFuncs[*fleetv1.BundleDeployment]{
 				UpdateFunc: func(e event.TypedUpdateEvent[*fleetv1.BundleDeployment]) bool {
 					return e.ObjectNew.Status.Ready && !e.ObjectOld.Status.Ready
@@ -289,17 +257,6 @@ func (r *BundleDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if status, err := r.Deployer.DeployBundle(ctx, bd, forceDeploy); err != nil {
 		// do not use the returned status, instead set the condition and possibly a timestamp
 		bd.Status = setCondition(bd.Status, err, monitor.Cond(fleetv1.BundleDeploymentConditionDeployed))
-
-		// Not-ready dependencies should not be treated as an error.
-		// Instead, a controlled requeue should happen until the conditions are met.
-		var notReadyDependenciesError *deployer.NotReadyDependenciesError
-		if errors.As(err, &notReadyDependenciesError) {
-			if err := r.updateStatus(ctx, orig, bd); err != nil {
-				return ctrl.Result{}, err
-			}
-			logger.V(1).Info("Dependencies not ready, requeuing...", "pending", notReadyDependenciesError.Pending)
-			return ctrl.Result{RequeueAfter: durations.WaitForDependenciesReadyRequeueInterval}, nil
-		}
 
 		logger.V(1).Info("Failed to deploy bundle", "status", status, "error", err)
 		merr = append(merr, fmt.Errorf("failed deploying bundle: %w", err))
@@ -578,4 +535,105 @@ func ignoreConflict(err error) error {
 		return nil
 	}
 	return err
+}
+
+func (r *BundleDeploymentReconciler) indexBundleDeployment(rawObj client.Object) []string {
+	bd, ok := rawObj.(*fleetv1.BundleDeployment)
+	if !ok {
+		return nil
+	}
+
+	var s []string
+	for _, v := range bd.Spec.DependsOn {
+		if v.Name != "" {
+			s = append(s, indexBundleDeploymentDependencyName(v.Name))
+		}
+
+		if v.Selector != nil {
+			for k := range v.Selector.MatchLabels {
+				s = append(s, indexBundleDeploymentDependencyLabel(k))
+			}
+
+			for _, expr := range v.Selector.MatchExpressions {
+				s = append(s, indexBundleDeploymentDependencyLabel(expr.Key))
+			}
+		}
+	}
+	// fmt.Printf("Indexing object %s, keys produced: %v\n", bd.Name, s)
+	return s
+}
+
+func indexBundleDeploymentDependencyName(name string) string {
+	return "name:" + name
+}
+
+func indexBundleDeploymentDependencyLabel(key string) string {
+	return "key:" + key
+}
+
+// create fake bundledeployment reconciler with a different index multiple lists and less calls to IsDependency
+// change the function to list all bundles on that index.. one list and multiple calls to IsDependency
+func (r *BundleDeploymentReconciler) findObjectsDependingOn(ctx context.Context, bundleA *fleetv1.BundleDeployment) []reconcile.Request {
+	var searchValues []string
+	searchValues = append(searchValues, indexBundleDeploymentDependencyName(bundleA.Name))
+	for k := range bundleA.Labels {
+		searchValues = append(searchValues, indexBundleDeploymentDependencyLabel(k))
+	}
+	var list fleetv1.BundleDeploymentList
+	candidates := make(map[string]fleetv1.BundleDeployment)
+
+	for _, v := range searchValues {
+		err := r.List(ctx, &list,
+			client.MatchingFields{dependsOnIndexKey: v},
+			client.InNamespace(bundleA.Namespace),
+		)
+		if err != nil {
+			continue
+		}
+
+		for _, item := range list.Items {
+			candidates[item.Name] = item
+		}
+	}
+
+	requests := make([]reconcile.Request, 0, len(candidates))
+	for _, bd := range candidates {
+		if IsDependency(bundleA, &bd) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: client.ObjectKeyFromObject(&bd),
+			})
+		}
+	}
+
+	return requests
+}
+
+func IsDependency(parent *fleetv1.BundleDeployment, candidate *fleetv1.BundleDeployment) bool {
+	labelSet := labels.Set(parent.Labels)
+	for _, dependency := range candidate.Spec.DependsOn {
+		if dependency.Name == "" && dependency.Selector == nil {
+			continue
+		}
+
+		var ls *metav1.LabelSelector
+		if dependency.Selector != nil {
+			ls = dependency.Selector.DeepCopy()
+		} else {
+			ls = &metav1.LabelSelector{}
+		}
+
+		if dependency.Name != "" {
+			metav1.AddLabelToSelector(ls, fleetv1.BundleLabel, parent.Name)
+		}
+
+		sel, err := metav1.LabelSelectorAsSelector(ls)
+		if err != nil {
+			continue
+		}
+
+		if sel.Matches(labelSet) {
+			return true
+		}
+	}
+	return false
 }
