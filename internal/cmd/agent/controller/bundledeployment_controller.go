@@ -77,7 +77,7 @@ const (
 func (r *BundleDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	logger := log.Log.WithName("bundledeployment")
 
-	err := mgr.GetFieldIndexer().IndexField(context.Background(), &fleetv1.BundleDeployment{}, dependsOnIndexKey, r.indexBundleDeployment)
+	err := mgr.GetFieldIndexer().IndexField(context.Background(), &fleetv1.BundleDeployment{}, dependsOnIndexKey, indexBundleDeployment)
 	if err != nil {
 		logger.Error(err, "Failed to index spec.dependsOn")
 		return err
@@ -537,7 +537,7 @@ func ignoreConflict(err error) error {
 	return err
 }
 
-func (r *BundleDeploymentReconciler) indexBundleDeployment(rawObj client.Object) []string {
+func indexBundleDeployment(rawObj client.Object) []string {
 	bd, ok := rawObj.(*fleetv1.BundleDeployment)
 	if !ok {
 		return nil
